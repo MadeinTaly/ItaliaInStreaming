@@ -6,6 +6,9 @@ concurrency:
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ master ]
+    paths: [ "StreamingCommunity/**" ]
 
 jobs:
   build:
@@ -61,12 +64,21 @@ jobs:
           cd $GITHUB_WORKSPACE/src
           chmod +x gradlew
           
-          ./gradlew make makePluginsJson \
+          ./gradlew StreamingCommunity:make makePluginsJson \
             -Pgpr.user="$GITHUB_ACTOR" \
             -Pgpr.key="$GITHUB_TOKEN"
             
-          cp **/build/*.cs3 $GITHUB_WORKSPACE/builds
-          cp build/plugins.json $GITHUB_WORKSPACE/builds
+          cp StreamingCommunity/build/*.cs3 $GITHUB_WORKSPACE/builds
+
+      # Fork: solo StreamingCommunity viene da qui, gli altri plugin restano quelli di upstream
+      - name: Merge plugins.json and repo.json
+        run: |
+          cd $GITHUB_WORKSPACE
+          curl -fsSL https://raw.githubusercontent.com/DieGon7771/ItaliaInStreaming/builds/plugins.json -o upstream.json
+          jq -s '[.[0][] | select(.internalName != "StreamingCommunity")] + [.[1][] | select(.internalName == "StreamingCommunity")]' \
+            upstream.json src/build/plugins.json > builds/plugins.json
+          jq --arg r "$GITHUB_REPOSITORY" '.pluginLists = ["https://raw.githubusercontent.com/\($r)/builds/plugins.json"]' \
+            builds/repo.json > repo.tmp && mv repo.tmp builds/repo.json
 
       - name: Push builds
         run: |

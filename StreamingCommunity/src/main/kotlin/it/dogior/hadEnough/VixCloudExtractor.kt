@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONObject
 
 class VixCloudExtractor : ExtractorApi() {
@@ -78,13 +79,13 @@ class VixCloudExtractor : ExtractorApi() {
     private suspend fun getScript(url: String): JSONObject {
         Log.d(TAG, "Item url: $url")
 
-        val iframe = app.get(url, headers = h, interceptor = CloudflareKiller()).document
-        Log.d(TAG, iframe.toString())
-
-//        Log.d(TAG, iframe.document.toString())
-        val scripts = iframe.select("script")
-        val script =
-            scripts.find { it.data().contains("masterPlaylist") }!!.data().replace("\n", "\t")
+        val response = app.get(url, headers = h, interceptor = CloudflareKiller())
+        val body = response.body.string()
+        NetworkBlock.check(response.url.toHttpUrl().host, body)
+        val script = org.jsoup.Jsoup.parse(body).select("script")
+            .find { it.data().contains("masterPlaylist") }
+            ?.data()?.replace("\n", "\t")
+            ?: throw Exception("masterPlaylist non trovato in $url")
 
         val scriptJson = getSanitisedScript(script)
         Log.d(TAG, "Script Json: $scriptJson")
