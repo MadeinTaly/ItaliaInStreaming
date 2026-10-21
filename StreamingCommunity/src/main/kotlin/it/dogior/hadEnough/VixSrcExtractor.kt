@@ -2,17 +2,21 @@ package it.dogior.hadEnough
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
 
+/**
+ * vixsrc.to/{movie|tv}/... e' un'app Next.js renderizzata lato client; /api/... restituisce
+ * subito l'embed, che e' lo stesso player di VixCloud ma con canPlayFHD attivo (1080p).
+ * Niente WebView: due richieste invece di ~15 s di pagina caricata.
+ */
 class VixSrcExtractor : ExtractorApi() {
     override val mainUrl = "https://vixsrc.to"
     override val name = "VixSrc"
-    override val requiresReferer = true
+    override val requiresReferer = false
+
+    private data class ApiResponse(val src: String)
 
     override suspend fun getUrl(
         url: String,
@@ -20,41 +24,18 @@ class VixSrcExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val resolver = WebViewResolver(
-            interceptUrl = Regex("""playlist.*token"""),
-            useOkhttp = true,
-            timeout = 15000L
+        // url: https://vixsrc.to/movie/{tmdb}?lang=it oppure /tv/{tmdb}/{s}/{e}?lang=it
+        val apiUrl = url.replace("$mainUrl/", "$mainUrl/api/")
+        val api = app.get(apiUrl, referer = "$mainUrl/", interceptor = Cloudflare)
+        val body = api.body.string()
+        Cloudflare.check("vixsrc.to", body)
+        val src = parseJson<ApiResponse>(body).src
+        VixCloudExtractor.extract(
+            embedUrl = mainUrl + src,
+            referer = "$mainUrl/",
+            source = name,
+            linkName = "Streaming Community - VixSrc",
+            callback = callback
         )
-        
-        try {
-            val response = app.get(
-                url = url,
-                referer = mainUrl,
-                interceptor = resolver,
-                headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-            )
-            
-            val m3u8Url = response.url
-            
-            if (m3u8Url.contains("playlist") && m3u8Url.contains("token")) {
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = m3u8Url,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = mainUrl
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mapOf(
-                            "Origin" to mainUrl,
-                            "Referer" to mainUrl
-                        )
-                    }
-                )
-            }
-        } catch (_: Exception) {}
     }
 }

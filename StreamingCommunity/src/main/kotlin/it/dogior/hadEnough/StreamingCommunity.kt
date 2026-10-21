@@ -15,7 +15,6 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.amap
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponseList
 import com.lagradost.cloudstream3.newSearchResponseList
@@ -40,6 +39,10 @@ import org.jsoup.parser.Parser
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class StreamingCommunity(
     override var lang: String = "it",
@@ -47,8 +50,7 @@ class StreamingCommunity(
 ) : MainAPI() {
     private val siteRootUrl = "https://streamingcommunityz.build/"
     private val cdnHost = "cdn.streamingcommunityz.build"
-    // risolve la challenge Cloudflare (tipica su VPN) in WebView e riusa il cookie cf_clearance
-    private val cfKiller = CloudflareKiller()
+    private val setupLock = Mutex()
     private var inertiaVersion = ""
     private var decodedXsrfToken = ""
     private val headers = mapOf(
@@ -163,8 +165,13 @@ class StreamingCommunity(
         )
     }
 
+    private suspend fun ensureHeaders() {
+        if (inertiaVersion.isNotEmpty()) return
+        setupLock.withLock { if (inertiaVersion.isEmpty()) setupHeaders() }
+    }
+
     private suspend fun setupHeaders() {
-        val response = app.get("$mainUrl/archive", interceptor = cfKiller)
+        val response = app.get("$mainUrl/archive", interceptor = Cloudflare)
         val cookieJar = linkedMapOf<String, String>()
         response.cookies.forEach { cookieJar[it.key] = it.value }
 
@@ -174,7 +181,7 @@ class StreamingCommunity(
                 "Referer" to "$mainUrl/",
                 "X-Requested-With" to "XMLHttpRequest"
             ),
-            interceptor = cfKiller
+            interceptor = Cloudflare
         )
         csrfResponse.cookies.forEach { cookieJar[it.key] = it.value }
 
@@ -222,9 +229,7 @@ class StreamingCommunity(
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        if (headers["Cookie"].isNullOrEmpty()) {
-            setupHeaders()
-        }
+        ensureHeaders()
 
         val hasNext = page < 17
         when (request.name) {
@@ -235,7 +240,7 @@ class StreamingCommunity(
                     "${siteRootUrl}api/sliders/fetch?lang=$lang",
                     headers = getSliderFetchHeaders(),
                     requestBody = body.toRequestBody(),
-                    interceptor = cfKiller
+                    interceptor = Cloudflare
                 )
                 val payload = response.body.string()
                 val r = parseSliderFetchSections(payload) ?: return null
@@ -251,7 +256,7 @@ class StreamingCommunity(
                         "genre[]" to genre.id.toString()
                     ),
                     headers = getSliderFetchHeaders(),
-                    interceptor = cfKiller
+                    interceptor = Cloudflare
                 )
                 val payload = response.body.string()
                 val data =
@@ -272,7 +277,7 @@ class StreamingCommunity(
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search"
-        val response = app.get(url, params = mapOf("q" to query), interceptor = cfKiller).body.string()
+        val response = app.get(url, params = mapOf("q" to query), interceptor = Cloudflare).body.string()
         val titles = parseBrowseTitles(response, "Search")
         return searchResponseBuilder(titles)
     }
@@ -280,23 +285,16 @@ class StreamingCommunity(
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val params = mutableMapOf("q" to query)
         if (page > 1) params["page"] = page.toString()
-        val response = app.get("$mainUrl/search", params = params, interceptor = cfKiller).body.string()
+        val response = app.get("$mainUrl/search", params = params, interceptor = Cloudflare).body.string()
         val titles = parseBrowseTitles(response, "Search page=$page")
         val items = searchResponseBuilder(titles)
         val hasNext = items.isNotEmpty() && items.size >= 60
         return newSearchResponseList(items, hasNext = hasNext)
     }
 
-    private suspend fun getPoster(title: TitleProp): String? {
-        if (title.tmdbId != null) {
-            val tmdbUrl = "https://www.themoviedb.org/${title.type}/${title.tmdbId}"
-            val resp = app.get(tmdbUrl).document
-            val img = resp.select("img.poster.w-full").attr("srcset").split(", ").last()
-            return img
-        } else {
-            return title.getBackgroundImageId().let { "https://$cdnHost/images/$it" }
-        }
-    }
+    private fun getPoster(title: TitleProp): String? =
+        (title.getPosterImageId() ?: title.getBackgroundImageId())
+            ?.let { "https://$cdnHost/images/$it" }
 
     
     private suspend fun fetchTmdbLogoUrl(
@@ -304,7 +302,7 @@ class StreamingCommunity(
         tmdbId: Int?,
         appLangCode: String?
     ): String? {
-        if (tmdbId == null) return null
+        if (tmdbId == null || tmdbApiKey.isBlank() || tmdbApiKey == "null") return null
         
         return try {
             val appLang = appLangCode?.substringBefore("-")?.lowercase()
@@ -381,12 +379,10 @@ class StreamingCommunity(
 
     override suspend fun load(url: String): LoadResponse {
         val actualUrl = getActualUrl(url)
-        if (headers["Cookie"].isNullOrEmpty()) {
-            setupHeaders()
-        }
-        val response = app.get(actualUrl, headers = headers, interceptor = cfKiller)
+        ensureHeaders()
+        val response = app.get(actualUrl, headers = headers, interceptor = Cloudflare)
         val responseBody = response.body.string()
-        NetworkBlock.check(response.url.toHttpUrl().host, responseBody)
+        Cloudflare.check(response.url.toHttpUrl().host, responseBody)
 
         val props = parseJson<InertiaResponse>(responseBody).props
         val title = props.title!!
@@ -396,17 +392,18 @@ class StreamingCommunity(
         val trailers = title.trailers?.mapNotNull { it.getYoutubeUrl() }
         val poster = getPoster(title)
 
-        val logoUrl = if (showLogo && title.tmdbId != null) {
-            val type = if (title.type == "tv") TvType.TvSeries else TvType.Movie
-            fetchTmdbLogoUrl(
-                type = type,
-                tmdbId = title.tmdbId,
-                appLangCode = lang
-            )
-        } else null
+        val (logoUrl, episodes) = coroutineScope {
+            val logo = async {
+                if (showLogo && title.tmdbId != null) {
+                    val type = if (title.type == "tv") TvType.TvSeries else TvType.Movie
+                    fetchTmdbLogoUrl(type = type, tmdbId = title.tmdbId, appLangCode = lang)
+                } else null
+            }
+            val eps = async { if (title.type == "tv") getEpisodes(props) else emptyList() }
+            logo.await() to eps.await()
+        }
 
         if (title.type == "tv") {
-            val episodes: List<Episode> = getEpisodes(props)
 
             val tvShow = newTvSeriesLoadResponse(
                 title.name,
@@ -441,7 +438,7 @@ class StreamingCommunity(
             return tvShow
         } else {
             val data = LoadData(
-                "$mainUrl/iframe/${title.id}&canPlayFHD=1",
+                "$mainUrl/iframe/${title.id}?canPlayFHD=1",
                 "movie",
                 title.tmdbId
             )
@@ -493,44 +490,37 @@ class StreamingCommunity(
         }
 
     private suspend fun getEpisodes(props: Props): List<Episode> {
-        val episodeList = mutableListOf<Episode>()
-        val title = props.title
+        val title = props.title ?: return emptyList()
 
-        title?.seasons?.forEach { season ->
-            val responseEpisodes = emptyList<it.dogior.hadEnough.Episode>().toMutableList()
-            if (season.id == props.loadedSeason!!.id) {
-                responseEpisodes.addAll(props.loadedSeason.episodes!!)
+        return title.seasons.orEmpty().amap { season ->
+            val seasonEpisodes = if (season.id == props.loadedSeason?.id) {
+                props.loadedSeason?.episodes.orEmpty()
             } else {
-                if (inertiaVersion == "") {
-                    setupHeaders()
-                }
+                ensureHeaders()
                 val url = "$mainUrl/titles/${title.id}-${title.slug}/season-${season.number}"
-                val obj =
-                    parseJson<InertiaResponse>(app.get(url, headers = headers, interceptor = cfKiller).body.string())
-                responseEpisodes.addAll(obj.props.loadedSeason?.episodes!!)
+                runCatching {
+                    val body = app.get(url, headers = headers, interceptor = Cloudflare).body.string()
+                    parseJson<InertiaResponse>(body).props.loadedSeason?.episodes.orEmpty()
+                }.onFailure { Log.e(TAG, "Stagione ${season.number}: ${it.message}") }
+                    .getOrDefault(emptyList())
             }
-            responseEpisodes.forEach { ep ->
-
+            seasonEpisodes.map { ep ->
                 val loadData = LoadData(
                     "$mainUrl/iframe/${title.id}?episode_id=${ep.id}&canPlayFHD=1",
                     type = "tv",
                     tmdbId = title.tmdbId,
                     seasonNumber = season.number,
                     episodeNumber = ep.number)
-                episodeList.add(
-                    newEpisode(loadData.toJson()) {
-                        this.name = ep.name
-                        this.posterUrl = props.cdnUrl + "/images/" + ep.getCover()
-                        this.description = ep.plot
-                        this.episode = ep.number
-                        this.season = season.number
-                        this.runTime = ep.duration
-                    }
-                )
+                newEpisode(loadData.toJson()) {
+                    this.name = ep.name
+                    this.posterUrl = props.cdnUrl + "/images/" + ep.getCover()
+                    this.description = ep.plot
+                    this.episode = ep.number
+                    this.season = season.number
+                    this.runTime = ep.duration
+                }
             }
-        }
-
-        return episodeList
+        }.flatten()
     }
 
     override suspend fun loadLinks(
@@ -551,23 +541,24 @@ class StreamingCommunity(
         }
 
         val vixsrcUrl = if(loadData.type == "movie"){
-            "https://vixsrc.to/movie/${loadData.tmdbId}"
+            "https://vixsrc.to/movie/${loadData.tmdbId}?lang=$lang"
         } else{
-            "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}"
+            "https://vixsrc.to/tv/${loadData.tmdbId}/${loadData.seasonNumber}/${loadData.episodeNumber}?lang=$lang"
         }
 
         // le due sorgenti sono indipendenti: in parallelo, e un errore in una non uccide l'altra
         val sources = listOf<Pair<String, suspend () -> Unit>>(
             "VixCloud" to {
-                val page = app.get(loadData.url, interceptor = cfKiller)
+                val page = app.get(loadData.url, referer = "$mainUrl/", interceptor = Cloudflare)
                 val body = page.body.string()
-                NetworkBlock.check(page.url.toHttpUrl().host, body)
+                Cloudflare.check(page.url.toHttpUrl().host, body)
                 val iframeSrc = org.jsoup.Jsoup.parse(body).select("iframe").attr("src")
                 if (iframeSrc.isBlank()) throw ErrorLoadingException("nessun iframe in ${loadData.url}")
-                VixCloudExtractor().getUrl(
-                    url = iframeSrc,
-                    referer = mainUrl.substringBeforeLast("it"),
-                    subtitleCallback = subtitleCallback,
+                VixCloudExtractor.extract(
+                    embedUrl = iframeSrc,
+                    referer = siteRootUrl,
+                    source = "VixCloud",
+                    linkName = "Streaming Community - VixCloud",
                     callback = linkCallback
                 )
             },
