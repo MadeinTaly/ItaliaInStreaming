@@ -69,6 +69,8 @@ class StreamingCommunity(
     companion object {
         var name = "StreamingCommunity"
         val TAG = "SCommunity"
+        const val BLOCKED_MESSAGE =
+            "Cloudflare blocca questo IP (VPN?). Cambia server VPN o escludi CloudStream dalla VPN"
     }
 
     private val tmdbAPI = "https://api.themoviedb.org/3"
@@ -165,6 +167,15 @@ class StreamingCommunity(
         )
     }
 
+    /** Blocco duro di Cloudflare: messaggio leggibile in CloudStream invece di liste vuote. */
+    private fun blockedCheck(url: String, body: String) {
+        try {
+            Cloudflare.check(url.toHttpUrl().host, body)
+        } catch (e: NetworkBlockedException) {
+            throw ErrorLoadingException(BLOCKED_MESSAGE)
+        }
+    }
+
     private suspend fun ensureHeaders() {
         if (inertiaVersion.isNotEmpty()) return
         setupLock.withLock { if (inertiaVersion.isEmpty()) setupHeaders() }
@@ -172,6 +183,7 @@ class StreamingCommunity(
 
     private suspend fun setupHeaders() {
         val response = app.get("$mainUrl/archive", interceptor = Cloudflare)
+        blockedCheck(response.url, response.text)
         val cookieJar = linkedMapOf<String, String>()
         response.cookies.forEach { cookieJar[it.key] = it.value }
 
@@ -183,6 +195,7 @@ class StreamingCommunity(
             ),
             interceptor = Cloudflare
         )
+        blockedCheck(csrfResponse.url, csrfResponse.text)
         csrfResponse.cookies.forEach { cookieJar[it.key] = it.value }
 
         headers["Cookie"] = cookieJar.entries.joinToString("; ") { "${it.key}=${it.value}" }
@@ -277,7 +290,8 @@ class StreamingCommunity(
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/search"
-        val response = app.get(url, params = mapOf("q" to query), interceptor = Cloudflare).body.string()
+        val response = app.get(url, params = mapOf("q" to query), interceptor = Cloudflare).text
+        blockedCheck(url, response)
         val titles = parseBrowseTitles(response, "Search")
         return searchResponseBuilder(titles)
     }
@@ -285,7 +299,8 @@ class StreamingCommunity(
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val params = mutableMapOf("q" to query)
         if (page > 1) params["page"] = page.toString()
-        val response = app.get("$mainUrl/search", params = params, interceptor = Cloudflare).body.string()
+        val response = app.get("$mainUrl/search", params = params, interceptor = Cloudflare).text
+        blockedCheck(mainUrl, response)
         val titles = parseBrowseTitles(response, "Search page=$page")
         val items = searchResponseBuilder(titles)
         val hasNext = items.isNotEmpty() && items.size >= 60
@@ -381,8 +396,8 @@ class StreamingCommunity(
         val actualUrl = getActualUrl(url)
         ensureHeaders()
         val response = app.get(actualUrl, headers = headers, interceptor = Cloudflare)
-        val responseBody = response.body.string()
-        Cloudflare.check(response.url.toHttpUrl().host, responseBody)
+        val responseBody = response.text
+        blockedCheck(response.url, responseBody)
 
         val props = parseJson<InertiaResponse>(responseBody).props
         val title = props.title!!
@@ -579,7 +594,7 @@ class StreamingCommunity(
         }
 
         if (!foundLinks.get() && blocked.get()) {
-            throw ErrorLoadingException("Bloccato da Cloudflare: cambia server VPN o disattivala")
+            throw ErrorLoadingException(BLOCKED_MESSAGE)
         }
         return foundLinks.get()
     }

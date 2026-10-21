@@ -30,8 +30,20 @@ object Cloudflare : Interceptor {
         response.code in listOf(403, 503) &&
             response.header("Server")?.startsWith("cloudflare") == true
 
+    private fun isHardBlock(response: Response) =
+        runCatching { response.peekBody(256 * 1024).string() }
+            .getOrDefault("").let { body -> BLOCK_MARKERS.any { it in body } }
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val host = chain.request().url.host
+        if (killer.savedCookies[host] == null) {
+            // Prima la richiesta normale: se non e' una challenge non serve CloudflareKiller.
+            // Se e' il blocco duro la WebView non lo risolve mai e resterebbe appesa 120 s
+            // per richiesta: la pagina torna al chiamante, che con check() da' l'errore.
+            val first = chain.proceed(chain.request())
+            if (!isChallenge(first) || isHardBlock(first)) return first
+            first.close()
+        }
         val response = killer.intercept(chain)
         if (!isChallenge(response) || killer.savedCookies[host] == null) return response
         response.close()
